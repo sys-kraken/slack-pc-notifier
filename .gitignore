@@ -1,0 +1,20 @@
+# Secrets - never commit these.
+# .env.example holds real working values in this repo (not placeholders);
+# .env.sample is the placeholder template that IS safe to publish.
+.env
+.env.*
+*.env
+!.env.sample
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

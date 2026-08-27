@@ -1,0 +1,21 @@
+# Render Blueprint - lets you deploy this with "New +" -> "Blueprint" in the
+# Render dashboard, pointing at the repo/folder containing this file.
+# You can also skip this and just create a Web Service manually (see SETUP.md).
+services:
+  - type: web
+    name: slack-pc-notifier-relay
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: SLACK_USER_TOKEN
+        sync: false
+      - key: SLACK_SELF_USER_ID
+        sync: false
+      - key: PC_NOTIFY_URL
+        sync: false
+      - key: RELAY_SHARED_SECRET
+        sync: false
