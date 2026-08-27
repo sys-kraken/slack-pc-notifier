@@ -126,11 +126,12 @@ def resolve_user_name(user_id):
     return name
 
 
-def forward_to_pc(title, message):
+def forward_to_pc(title, message, channel="", thread_ts=""):
     try:
         resp = requests.post(
             PC_NOTIFY_URL,
-            json={"title": title, "message": message},
+            json={"title": title, "message": message,
+                  "channel": channel, "thread_ts": thread_ts},
             headers={"X-Relay-Secret": RELAY_SHARED_SECRET},
             timeout=6,
         )
@@ -189,6 +190,53 @@ def health():
     return jsonify(status="ok")
 
 
+@app.route("/reply", methods=["POST"])
+def reply():
+    """
+    Post a reply typed into a Windows toast back to Slack.
+
+    The PC listener has no Slack token of its own on purpose - it proves
+    itself with the same shared secret used for /notify, and this relay does
+    the posting. Messages go out as the authorising user, not a bot.
+    """
+    secret = request.headers.get("X-Relay-Secret", "")
+    if not hmac.compare_digest(secret, RELAY_SHARED_SECRET):
+        log.warning("Rejected reply with bad/missing secret")
+        return jsonify(ok=False, error="forbidden"), 403
+
+    body = request.get_json(silent=True) or {}
+    channel = (body.get("channel") or "").strip()
+    text = (body.get("text") or "").strip()
+    if not channel or not text:
+        return jsonify(ok=False, error="channel and text are required"), 400
+
+    payload = {"channel": channel, "text": text}
+    # Keep the reply in the thread when the original message was in one.
+    if body.get("thread_ts"):
+        payload["thread_ts"] = body["thread_ts"]
+
+    try:
+        resp = requests.post(
+            f"{SLACK_API}/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_USER_TOKEN}",
+                     "Content-Type": "application/json; charset=utf-8"},
+            json=payload,
+            timeout=8,
+        )
+        data = resp.json()
+    except requests.RequestException as e:
+        log.warning("chat.postMessage error: %s", e)
+        return jsonify(ok=False, error=str(e)), 502
+
+    if not data.get("ok"):
+        log.warning("chat.postMessage failed: %s", data.get("error"))
+        return jsonify(ok=False, error=data.get("error")), 502
+
+    log.info("Replied to %s", channel)
+    return jsonify(ok=True, ts=data.get("ts")), 200
+
+
+
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     if not verify_slack_signature(request):
@@ -236,7 +284,8 @@ def slack_events():
         else:
             title = f"{sender} in {channel_label}"
 
-        forward_to_pc(title, humanize_slack_text(text)[:300])
+        forward_to_pc(title, humanize_slack_text(text)[:300],
+                      channel=channel_id, thread_ts=event.get("thread_ts", ""))
 
     return "", 200
 
