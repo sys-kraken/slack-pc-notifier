@@ -21,6 +21,7 @@ Env vars required (set these in the Render dashboard, never commit them):
 import hashlib
 import hmac
 import os
+import re
 import time
 import logging
 
@@ -143,6 +144,46 @@ def forward_to_pc(title, message):
 # HEAD is what uptime monitors (UptimeRobot etc.) send by default. Flask
 # derives it from GET automatically, but it's listed explicitly so a keep-warm
 # pinger can't be broken by an innocent-looking edit to this route.
+# Slack sends its own markup rather than display text: user mentions arrive as
+# <@U123>, channels as <#C123|name>, links as <url|label>, and &<> are HTML
+# escaped. Left alone, a toast reads "<@U06F8T2AVK8> sent you a ticket".
+_REF_RE = re.compile(r"<([@#!])([^>|]+)(?:\|([^>]*))?>")
+_LINK_RE = re.compile(r"<((?:https?|mailto|tel):[^>|]+)(?:\|([^>]*))?>")
+
+
+def humanize_slack_text(text: str) -> str:
+    """Turn Slack's mrkdwn into something readable in a Windows toast."""
+    if not text:
+        return text
+
+    # Links first, so their URLs can't be mistaken for a <...> reference.
+    text = _LINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+
+    def _ref(m):
+        kind, body, label = m.group(1), m.group(2), m.group(3)
+        if kind == "@":
+            # Slack usually omits the label, so resolve the id via the API.
+            return "@" + (label or resolve_user_name(body))
+        if kind == "#":
+            if label:
+                return "#" + label
+            name = resolve_channel_name(body, "channel")
+            return name if name.startswith("#") else "#" + name
+        if kind == "!":
+            if body in ("here", "channel", "everyone"):
+                return "@" + body
+            if body.startswith("subteam^"):
+                return label or "@team"
+            return label or ("@" + body)
+        return m.group(0)
+
+    text = _REF_RE.sub(_ref, text)
+
+    # Unescape last: doing it earlier could manufacture a bogus <...> ref.
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     return jsonify(status="ok")
@@ -195,7 +236,7 @@ def slack_events():
         else:
             title = f"{sender} in {channel_label}"
 
-        forward_to_pc(title, text[:300])
+        forward_to_pc(title, humanize_slack_text(text)[:300])
 
     return "", 200
 
