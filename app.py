@@ -45,6 +45,7 @@ SLACK_API = "https://slack.com/api"
 _channel_name_cache = {}
 _user_name_cache = {}
 _seen_event_ids = set()  # de-dupe Slack's at-least-once retries
+_team_id = None  # resolved once via auth.test, needed for slack:// links
 
 SUBTYPES_TO_IGNORE = {
     "message_changed",
@@ -126,12 +127,40 @@ def resolve_user_name(user_id):
     return name
 
 
-def forward_to_pc(title, message, channel="", thread_ts=""):
+def get_team_id():
+    """
+    Workspace id, needed to build slack:// deep links. Resolved once and kept
+    for the life of the process; a failure here must never block a toast.
+    """
+    global _team_id
+    if _team_id is None:
+        data = slack_api_get("auth.test", {})
+        if data:
+            _team_id = data.get("team_id", "")
+    return _team_id or ""
+
+
+def build_deep_link(channel_id, ts):
+    """
+    A slack:// link opens the desktop app directly on the message. Falls back
+    to no link if we could not resolve the workspace id.
+    """
+    team = get_team_id()
+    if not team or not channel_id:
+        return ""
+    link = f"slack://channel?team={team}&id={channel_id}"
+    if ts:
+        link += f"&message={ts}"
+    return link
+
+
+
+def forward_to_pc(title, message, channel="", thread_ts="", link=""):
     try:
         resp = requests.post(
             PC_NOTIFY_URL,
             json={"title": title, "message": message,
-                  "channel": channel, "thread_ts": thread_ts},
+                  "channel": channel, "thread_ts": thread_ts, "link": link},
             headers={"X-Relay-Secret": RELAY_SHARED_SECRET},
             timeout=6,
         )
@@ -285,7 +314,8 @@ def slack_events():
             title = f"{sender} in {channel_label}"
 
         forward_to_pc(title, humanize_slack_text(text)[:300],
-                      channel=channel_id, thread_ts=event.get("thread_ts", ""))
+                      channel=channel_id, thread_ts=event.get("thread_ts", ""),
+                      link=build_deep_link(channel_id, event.get("ts", "")))
 
     return "", 200
 
