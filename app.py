@@ -44,6 +44,7 @@ SLACK_API = "https://slack.com/api"
 # Simple in-memory caches (fine for a single personal-use dyno)
 _channel_name_cache = {}
 _user_name_cache = {}
+_user_avatar_cache = {}
 _seen_event_ids = set()  # de-dupe Slack's at-least-once retries
 _team_id = None  # resolved once via auth.test, needed for slack:// links
 
@@ -122,9 +123,25 @@ def resolve_user_name(user_id):
         user = data.get("user", {})
         profile = user.get("profile", {})
         name = profile.get("display_name") or profile.get("real_name") or user.get("name") or user_id
+        # image_72 is plenty for a toast and keeps the download small.
+        _user_avatar_cache[user_id] = (
+            profile.get("image_72") or profile.get("image_192") or ""
+        )
 
     _user_name_cache[user_id] = name
     return name
+
+
+def resolve_user_avatar(user_id):
+    """
+    Avatar URL for a sender. These are public CDN links - no token needed -
+    so the PC can fetch them directly without holding a Slack credential.
+    """
+    if not user_id:
+        return ""
+    if user_id not in _user_avatar_cache:
+        resolve_user_name(user_id)  # one API call populates name and avatar
+    return _user_avatar_cache.get(user_id, "")
 
 
 def get_team_id():
@@ -155,12 +172,13 @@ def build_deep_link(channel_id, ts):
 
 
 
-def forward_to_pc(title, message, channel="", thread_ts="", link=""):
+def forward_to_pc(title, message, channel="", thread_ts="", link="", avatar=""):
     try:
         resp = requests.post(
             PC_NOTIFY_URL,
             json={"title": title, "message": message,
-                  "channel": channel, "thread_ts": thread_ts, "link": link},
+                  "channel": channel, "thread_ts": thread_ts,
+                  "link": link, "avatar": avatar},
             headers={"X-Relay-Secret": RELAY_SHARED_SECRET},
             timeout=6,
         )
@@ -315,7 +333,8 @@ def slack_events():
 
         forward_to_pc(title, humanize_slack_text(text)[:300],
                       channel=channel_id, thread_ts=event.get("thread_ts", ""),
-                      link=build_deep_link(channel_id, event.get("ts", "")))
+                      link=build_deep_link(channel_id, event.get("ts", "")),
+                      avatar=resolve_user_avatar(user_id))
 
     return "", 200
 
