@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import os
 import re
+from urllib.parse import urlparse
 import time
 import logging
 
@@ -172,13 +173,46 @@ def build_deep_link(channel_id, ts):
 
 
 
-def forward_to_pc(title, message, channel="", thread_ts="", link="", avatar=""):
+# Only ever proxy Slack's own file hosts. Without this the /file endpoint below
+# would be an open proxy that happily attaches your Slack token to any URL a
+# caller names.
+_ALLOWED_FILE_HOSTS = ("slack.com", "slack-files.com", "slack-edge.com")
+
+
+def is_slack_file_url(url: str) -> bool:
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return False
+    if parts.scheme != "https":
+        return False
+    host = (parts.hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _ALLOWED_FILE_HOSTS)
+
+
+def pick_image(files):
+    """
+    Choose an image worth previewing, preferring a small Slack-made thumbnail
+    over the full-size original - a toast shows it at a few hundred pixels.
+    """
+    for f in files or []:
+        if not (f.get("mimetype") or "").startswith("image/"):
+            continue
+        for key in ("thumb_360", "thumb_480", "thumb_720", "url_private"):
+            if f.get(key):
+                return f[key]
+    return ""
+
+
+
+def forward_to_pc(title, message, channel="", thread_ts="", link="", avatar="",
+                  image=""):
     try:
         resp = requests.post(
             PC_NOTIFY_URL,
             json={"title": title, "message": message,
                   "channel": channel, "thread_ts": thread_ts,
-                  "link": link, "avatar": avatar},
+                  "link": link, "avatar": avatar, "image": image},
             headers={"X-Relay-Secret": RELAY_SHARED_SECRET},
             timeout=6,
         )
@@ -235,6 +269,58 @@ def humanize_slack_text(text: str) -> str:
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     return jsonify(status="ok")
+
+
+@app.route("/file", methods=["GET"])
+def file_proxy():
+    """
+    Stream a Slack-hosted file to the PC listener.
+
+    Slack's file URLs need the OAuth token, which deliberately never leaves
+    this relay - so the PC asks here instead, proving itself with the shared
+    secret. Only Slack's own hosts are fetched (see is_slack_file_url), so
+    this cannot be turned into a general-purpose proxy.
+    """
+    secret = request.headers.get("X-Relay-Secret", "")
+    if not hmac.compare_digest(secret, RELAY_SHARED_SECRET):
+        return "forbidden", 403
+
+    url = request.args.get("url", "")
+    if not is_slack_file_url(url):
+        log.warning("Refused to proxy non-Slack url: %s", url[:120])
+        return "bad url", 400
+
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {SLACK_USER_TOKEN}"},
+            timeout=15,
+            stream=True,
+        )
+    except requests.RequestException as e:
+        log.warning("File fetch error: %s", e)
+        return "upstream error", 502
+
+    if resp.status_code != 200:
+        log.warning("File fetch got %s", resp.status_code)
+        return "upstream error", 502
+
+    ctype = resp.headers.get("Content-Type", "application/octet-stream")
+    if not ctype.startswith("image/"):
+        # Slack answers with an HTML login page when the token cannot see the
+        # file, which would otherwise be cached on the PC as a broken image.
+        log.warning("File was not an image (%s)", ctype)
+        return "not an image", 415
+
+    # 4 MB ceiling - a toast thumbnail is far smaller, and this stops a huge
+    # upload from tying up the relay.
+    body = resp.raw.read(4 * 1024 * 1024 + 1, decode_content=True)
+    if len(body) > 4 * 1024 * 1024:
+        log.warning("File too large to forward")
+        return "too large", 413
+
+    return app.response_class(body, mimetype=ctype)
+
 
 
 @app.route("/reply", methods=["POST"])
@@ -317,8 +403,14 @@ def slack_events():
             return "", 200
 
         text = event.get("text", "").strip()
+        files = event.get("files") or []
+        image_url = pick_image(files)
         if not text:
-            return "", 200  # e.g. a file share with no text - skip for now
+            if not files:
+                return "", 200
+            # A screenshot with no caption used to notify you of nothing.
+            first = files[0]
+            text = f"[{first.get('title') or first.get('name') or 'shared a file'}]"
 
         channel_id = event.get("channel", "")
         channel_type = event.get("channel_type", "")
@@ -334,7 +426,8 @@ def slack_events():
         forward_to_pc(title, humanize_slack_text(text)[:300],
                       channel=channel_id, thread_ts=event.get("thread_ts", ""),
                       link=build_deep_link(channel_id, event.get("ts", "")),
-                      avatar=resolve_user_avatar(user_id))
+                      avatar=resolve_user_avatar(user_id),
+                      image=image_url)
 
     return "", 200
 
